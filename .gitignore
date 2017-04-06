@@ -1,0 +1,4 @@
+*.o
+*~
+optimization-seq
+optimization-mpi
