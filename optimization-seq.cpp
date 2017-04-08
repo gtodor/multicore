@@ -119,6 +119,7 @@ int main(void)
   cout << "Precision? ";
   cin >> precision;
 
+  
   minimize(fun.f,fun.x,fun.y,precision,min_ub,minimums);
   
   // Displaying all potential minimizers

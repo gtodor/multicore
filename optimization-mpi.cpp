@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include <vector>
 #include <mpi.h>
+#include <omp.h>
 #include "interval.h"
 #include "functions.h"
 #include "minimizer.h"
@@ -57,8 +58,10 @@ void minimize(itvfun f,  // Function to minimize
     min_ub = fxy.right();
     // Discarding all saved boxes whose minimum lower bound is 
     // greater than the new minimum upper bound
+
     auto discard_begin = ml.lower_bound(minimizer{0,0,min_ub,0});
     ml.erase(discard_begin,ml.end());
+    
   }
 
   // Checking whether the input box is small enough to stop searching.
@@ -66,7 +69,9 @@ void minimize(itvfun f,  // Function to minimize
   // is always split equally along both dimensions
   if (x.width() <= threshold) { 
     // We have potentially a new minimizer
+
     ml.insert(minimizer{x,y,fxy.left(),fxy.right()});
+    
     return ;
   }
 
@@ -164,7 +169,7 @@ int main(int argc,char** argv)
   vector<box>* boxes = new vector<box>(1,initbox);
   vector<box>* temp = new vector<box>();
   
-  while(boxes->size() < numprocs){
+  while(boxes->size() < 100){
     while(!boxes->empty()){
       interval x = boxes->back().x;
       interval y = boxes->back().y;
@@ -181,6 +186,7 @@ int main(int argc,char** argv)
     boxes = temp;
     temp = t;
   }
+  cout<<"BOXES SIZE = "<<boxes->size()<<endl;
 
   if(boxes->size() > numprocs){
     int remaining = boxes->size() - numprocs;
@@ -190,57 +196,67 @@ int main(int argc,char** argv)
   }
 
   int toanalyse = 1 + extra;
-  cout<<"number of boxes to analyze = "<<toanalyse<<endl; 
+  cout<<"number of boxes to analyze = "<<toanalyse<<endl;
+  
+  //cout<<"THREAD LIMIT "<<omp_get_thread_limit()<<endl;
 
-  //#pragma omp parallel for
+  omp_set_num_threads(toanalyse);
+  
+#pragma omp parallel for 
   for(int i = rank * toanalyse; i<rank* toanalyse + toanalyse; i++){
+
+    minimizer_list m;
+    
     cout<<"rank "<<rank<<" : step "<<i<<" before minimize"<<endl;
-    minimize(fun.f,boxes->at(i).x,boxes->at(i).y,precision,localmin,minimums);
+    
+    minimize(fun.f,boxes->at(i).x,boxes->at(i).y,precision,localmin,m);
     
     cout<<"rank "<<rank<<" : step "<<i<<" minimize ended"<<endl;
-
+    
     
     MPI_Allreduce(&localmin,&min_ub,1,MPI_DOUBLE,MPI_MIN,MPI_COMM_WORLD);
-    cout<<"rank "<<rank<<" : step "<<i<<" alreduce ended"<<endl;
-    if(localmin > min_ub){
-      auto discard_begin = minimums.lower_bound(minimizer{0,0,min_ub,0});
-      minimums.erase(discard_begin,minimums.end());
-    }
-    cout<<"rank "<<rank<<" : step "<<i<<" discarding wrong minimum box finished"<<endl;
+    cout<<"rank "<<rank<<" : step "<<i<<" allreduce ended"<<endl;
+    
+    auto discard_begin = m.lower_bound(minimizer{0,0,min_ub,0});   
+    m.erase(discard_begin,m.end());
+    
+    cout<<"rank "<<rank<<" : step "<<i<<" discarding wrong minimum boxes finished"<<endl;
     localmin = min_ub;
+
+    //insert all elements from local minimizer list to minimums
+    for(auto& min : m){
+      #pragma omp critical
+      minimums.insert(min);
+    }
     
   }
 
+  
+  auto discard_begin = minimums.lower_bound(minimizer{0,0,min_ub,0});
+  minimums.erase(discard_begin,minimums.end());
+    
+    
 
   int max_rank = numprocs ;
   int rest = boxes->size() - numprocs*toanalyse;
-  cout<<"threr are "<<boxes->size()<<" boxes to analyse"<<endl;
+  cout<<"there are "<<boxes->size()<<" boxes to analyse"<<endl;
   cout<<"numprocs = "<<numprocs<<endl;
   cout<<"rest = "<<rest<<endl;
   if(rest > 0){
-    int r = 0;
-    for(int j = 0; j < rest; j++){
-      if(rank == r){
-	minimize(fun.f,boxes->at(max_rank * toanalyse + j).x,boxes->at(max_rank * toanalyse + j).y,precision,localmin,minimums);
-	cout<<endl<<endl<<"rank "<<rank<<" extra box"<<endl;
-      }
+    
+    if(max_rank * toanalyse + rank < boxes->size()){
+      
+      minimize(fun.f,boxes->at(max_rank * toanalyse + rank).x,boxes->at(max_rank * toanalyse + rank).y,precision,localmin,minimums);
+      cout<<endl<<endl<<"rank "<<rank<<" extra box"<<endl;
       
       MPI_Allreduce(&localmin,&min_ub,1,MPI_DOUBLE,MPI_MIN,MPI_COMM_WORLD);
-      if(localmin > min_ub){
-	auto discard_begin = minimums.lower_bound(minimizer{0,0,min_ub,0});
-	minimums.erase(discard_begin,minimums.end());
-      }
-      localmin = min_ub;
       
-      r++;
+      auto discard_begin = minimums.lower_bound(minimizer{0,0,min_ub,0});
+      minimums.erase(discard_begin,minimums.end());
+	
+      localmin = min_ub;
     }
   }
-  /*
-  MPI_Allreduce(&localmin,&min_ub,1,MPI_DOUBLE,MPI_MIN,MPI_COMM_WORLD);
-
-  auto discard_begin = minimums.lower_bound(minimizer{0,0,min_ub,0});
-  minimums.erase(discard_begin,minimums.end());
-  */
   
   // Displaying all potential minimizers
   copy(minimums.begin(),minimums.end(),
