@@ -21,6 +21,8 @@
 
 using namespace std;
 
+//This structure contains the x and y domains where we will
+//evaluate the function
 struct box{
   interval x;
   interval y;
@@ -101,23 +103,41 @@ int main(int argc,char** argv)
 
   // Name of the function to optimize
   string choice_fun;
+  // Stores the name of the function as a c string and is used to send
+  // the function name with mpi which doesn't recognize c++ strings   
   char choice[100];
   // The information on the function chosen (pointer and initial box)
   opt_fun_t fun;
   
   bool good_choice;
 
+  //variable storing the number of subdomains of the initial box
+  int subdomains;
+
+  //the number of processors in the communicator and the rank of
+  //the current machine
   int numprocs, rank;
+
+  //Initializing MPI
   MPI_Init(&argc,&argv);
   MPI_Comm_size(MPI_COMM_WORLD,&numprocs);
   MPI_Comm_rank(MPI_COMM_WORLD,&rank);
 
-  //cout<<"numprocs = "<<numprocs<<endl;
-  //cout<<"rank = "<<rank<<endl;
+  //variable that holds the length of the function name
+  //needed because a client needs to know the length of the
+  //c string to read 
   int len = 0;
+
+  //variable storing the number of boxes each client has to process
+  //besides the one it is given by default
   int extra = 0;
+
+  //initializing the choice array
   memset(choice,0,100);
 
+  //variable that stores the local min_ub variable of each client
+  //it is used in MPI_Allreduce to define the new general min_ub
+  //and then it is replaced by the new min_ub 
   double localmin = min_ub;
 
   
@@ -146,34 +166,51 @@ int main(int argc,char** argv)
     cout << "Precision? ";
     cin >> precision;
 
+    //Ask for the minimum number of subdomains we want to split the initial box
+    cout<<"Number of subdomains? ";
+    cin>>subdomains;
+
     //Transform function name in a c type string to use in broadcast
     strcpy(choice,choice_fun.c_str());
     len = strlen(choice)+1;
-    cout<<len<<endl;
   }
-  
+
+  //send the length of the function name to all clients in the communicator
   MPI_Bcast(&len,1,MPI_INT,0,MPI_COMM_WORLD);
+  
+  //send the precision to everyone
   MPI_Bcast(&precision,1,MPI_DOUBLE,0,MPI_COMM_WORLD);
+  
+  //send the function name to everyone
   MPI_Bcast(choice,len,MPI_CHAR,0,MPI_COMM_WORLD);
 
+  //send the number of subdomains to everyone
+  MPI_Bcast(&subdomains,1,MPI_INT,0,MPI_COMM_WORLD);
+
+  //if the machine's rank is not 0 it has to load the function based by the
+  //function name it received from rank 0 by broadcast
   if(rank != 0){
     choice_fun = choice;
-    cout<<"rank "<<rank<<"received precision ="<<precision<<endl;
     fun = functions.at(choice_fun);
   }
 
-  //divide the initial box in n*n domain boxes n = nb of processors
-  //each processor is using n domains
-
+  
+  //each machine is dividing the initial box in "subdomains" number of boxes
+  //and it is going to use only some of them
+  
   box initbox = {fun.x,fun.y};
   vector<box>* boxes = new vector<box>(1,initbox);
+
+  //helper vector : at each iteration of the first while loop we split in four
+  //every box and store them in the temp vector, then we swap the two vectors
   vector<box>* temp = new vector<box>();
   
-  while(boxes->size() < 100){
+  while(boxes->size() < subdomains){
     while(!boxes->empty()){
       interval x = boxes->back().x;
       interval y = boxes->back().y;
       boxes->pop_back();
+      
       interval xl,yl,xr,yr;
       split_box(x,y,xl,xr,yl,yr);
       temp->push_back(box{xl,yl});
@@ -186,8 +223,9 @@ int main(int argc,char** argv)
     boxes = temp;
     temp = t;
   }
-  cout<<"BOXES SIZE = "<<boxes->size()<<endl;
 
+  //we compute the number of boxes every client has to process
+  //if some boxes remain we process them afterwards
   if(boxes->size() > numprocs){
     int remaining = boxes->size() - numprocs;
     int quotient = remaining / numprocs;
@@ -195,32 +233,35 @@ int main(int argc,char** argv)
     MPI_Bcast(&extra,1,MPI_INT,0,MPI_COMM_WORLD);
   }
 
+  //the total number of boxes to process
   int toanalyse = 1 + extra;
-  cout<<"number of boxes to analyze = "<<toanalyse<<endl;
   
-  //cout<<"THREAD LIMIT "<<omp_get_thread_limit()<<endl;
-
+  
   omp_set_num_threads(toanalyse);
-  
+
+  //the indexes of the boxes each client has to process are computed based on the rank
 #pragma omp parallel for 
   for(int i = rank * toanalyse; i<rank* toanalyse + toanalyse; i++){
 
+    //minimizer list private to the thread
+    //if not used there are some incorect accesses to the minimums variable causing
+    //segmentation fault errors we didn't manage to solve
     minimizer_list m;
     
-    cout<<"rank "<<rank<<" : step "<<i<<" before minimize"<<endl;
-    
-    minimize(fun.f,boxes->at(i).x,boxes->at(i).y,precision,localmin,m);
-    
-    cout<<"rank "<<rank<<" : step "<<i<<" minimize ended"<<endl;
-    
-    
+    minimize(fun.f,boxes->at(i).x,boxes->at(i).y,precision,localmin,m);  
+
+    //After processing the box every processor share it's localmin to everyone
+    //we reduce all these values and broadcast to every client using MPI_Allreduce
+    //after this function the variable min_ub will contain the new minimum
     MPI_Allreduce(&localmin,&min_ub,1,MPI_DOUBLE,MPI_MIN,MPI_COMM_WORLD);
-    cout<<"rank "<<rank<<" : step "<<i<<" allreduce ended"<<endl;
     
+  
+
+    //because there is a new minimum we need to clear some values from the minimize list
     auto discard_begin = m.lower_bound(minimizer{0,0,min_ub,0});   
     m.erase(discard_begin,m.end());
     
-    cout<<"rank "<<rank<<" : step "<<i<<" discarding wrong minimum boxes finished"<<endl;
+  
     localmin = min_ub;
 
     //insert all elements from local minimizer list to minimums
@@ -231,23 +272,21 @@ int main(int argc,char** argv)
     
   }
 
-  
+  //check for values not respecting the last min_ub computed in the previous loop
   auto discard_begin = minimums.lower_bound(minimizer{0,0,min_ub,0});
   minimums.erase(discard_begin,minimums.end());
-    
+  
     
 
   int max_rank = numprocs ;
   int rest = boxes->size() - numprocs*toanalyse;
-  cout<<"there are "<<boxes->size()<<" boxes to analyse"<<endl;
-  cout<<"numprocs = "<<numprocs<<endl;
-  cout<<"rest = "<<rest<<endl;
+  
   if(rest > 0){
     
+    //each remaining box is processed by a particular processor
     if(max_rank * toanalyse + rank < boxes->size()){
       
       minimize(fun.f,boxes->at(max_rank * toanalyse + rank).x,boxes->at(max_rank * toanalyse + rank).y,precision,localmin,minimums);
-      cout<<endl<<endl<<"rank "<<rank<<" extra box"<<endl;
       
       MPI_Allreduce(&localmin,&min_ub,1,MPI_DOUBLE,MPI_MIN,MPI_COMM_WORLD);
       
